@@ -10,7 +10,7 @@ import numpy as np
 import requests
 import torch
 import torchaudio.functional as AF
-from transformers import AutoModelForAudioClassification, AutoFeatureExtractor
+from transformers import pipeline
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 import uvicorn
@@ -39,250 +39,203 @@ def init_and_migrate_db():
             ai_prob REAL DEFAULT 0.0,
             human_prob REAL DEFAULT 0.0,
             duration_sec REAL DEFAULT 0.0,
-            model_used TEXT DEFAULT 'Multi-Engine-Ensemble',
+            model_used TEXT DEFAULT 'Dual-Ensemble (MelodyMachine + Wav2Vec2)',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    cursor.execute("PRAGMA table_info(call_sessions)")
+    existing_cols = [row[1] for row in cursor.fetchall()]
+    
+    needed_cols = {
+        "ai_prob": "REAL DEFAULT 0.0",
+        "human_prob": "REAL DEFAULT 0.0",
+        "duration_sec": "REAL DEFAULT 0.0",
+        "model_used": "TEXT DEFAULT 'Dual-Ensemble (MelodyMachine + Wav2Vec2)'",
+        "risk_score": "REAL DEFAULT 0.0",
+        "threat_level": "TEXT DEFAULT 'UNKNOWN'",
+        "action": "TEXT DEFAULT 'ALLOW'"
+    }
+    for col, col_def in needed_cols.items():
+        if col not in existing_cols:
+            cursor.execute(f"ALTER TABLE call_sessions ADD COLUMN {col} {col_def}")
     conn.commit()
     conn.close()
 
 init_and_migrate_db()
 
 # ============================================================================
-# 2. LOAD SOTA MULTI-GENERATOR DEEPFAKE ENSEMBLE
+# 2. DUAL-MODEL NEURAL ENSEMBLE LOADER
 # ============================================================================
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"[INFO] Initializing VoiceGuard Deepfake Engine on {device.upper()}...")
+MODEL_MELODY = "MelodyMachine/Deepfake-audio-detection-V2"
+MODEL_GARY = "garystafford/wav2vec2-deepfake-voice-detector"
 
-MODELS_CONFIG = [
-    {"name": "MelodyMachine-V2", "repo": "MelodyMachine/Deepfake-audio-detection-V2"},
-    {"name": "GaryStafford-Wav2Vec2", "repo": "garystafford/wav2vec2-deepfake-voice-detector"}
-]
+pipe_melody = None
+pipe_gary = None
+device_idx = 0 if torch.cuda.is_available() else -1
 
-loaded_models = []
+print("[INFO] Loading Dual-Model Neural Ensemble for High-Precision Detection...")
 
-for cfg in MODELS_CONFIG:
-    repo = cfg["repo"]
-    name = cfg["name"]
-    try:
-        print(f"[INFO] Loading model: {name} ({repo})...")
-        extractor = AutoFeatureExtractor.from_pretrained(repo)
-        mdl = AutoModelForAudioClassification.from_pretrained(repo)
-        mdl.to(device).eval()
+try:
+    pipe_melody = pipeline("audio-classification", model=MODEL_MELODY, device=device_idx)
+    print(f"[✓] Model 1 active: {MODEL_MELODY}")
+except Exception as e:
+    print(f"[WARN] Could not load {MODEL_MELODY}: {e}")
 
-        fake_idx = None
-        real_idx = None
-        id2label = getattr(mdl.config, "id2label", None)
-        if id2label and isinstance(id2label, dict):
-            for k, v in id2label.items():
-                lbl = str(v).lower().strip()
-                if any(w in lbl for w in ["fake", "spoof", "synthetic", "ai", "deepfake"]):
-                    fake_idx = int(k)
-                elif any(w in lbl for w in ["real", "bonafide", "human", "authentic"]):
-                    real_idx = int(k)
-
-        if fake_idx is None or real_idx is None:
-            if "MelodyMachine" in repo:
-                fake_idx, real_idx = 0, 1  # 0: Fake, 1: Real
-            else:
-                real_idx, fake_idx = 0, 1  # 0: Real, 1: Fake
-
-        loaded_models.append({
-            "name": name,
-            "repo": repo,
-            "model": mdl,
-            "extractor": extractor,
-            "fake_idx": fake_idx,
-            "real_idx": real_idx
-        })
-        print(f"[✓] {name} online (Fake Index: {fake_idx}, Real Index: {real_idx})")
-    except Exception as e:
-        print(f"[WARN] Failed to load {name} ({repo}): {e}")
+try:
+    pipe_gary = pipeline("audio-classification", model=MODEL_GARY, device=device_idx)
+    print(f"[✓] Model 2 active: {MODEL_GARY}")
+except Exception as e:
+    print(f"[WARN] Could not load {MODEL_GARY}: {e}")
 
 # ============================================================================
-# 3. ACOUSTIC ENGINE (NORMALIZED AUTOCORRELATION & JITTER)
+# 3. BIOLOGICAL GLOTTAL JITTER & VOWEL MICRO-TREMOR ENGINE
 # ============================================================================
-def extract_pitch_jitter_metrics(audio: np.ndarray, sr: int = 16000) -> dict:
-    if len(audio) < int(0.25 * sr):
-        return {"jitter": 1.2, "ai_bio_score": 0.0}
-
-    frame_len = int(0.040 * sr)
-    hop_len = int(0.015 * sr)
+def compute_glottal_jitter(audio: np.ndarray, sr: int = 16000) -> float:
+    """
+    Computes cycle-to-cycle fundamental frequency perturbation in vowels.
+    - Biological vocal cords naturally produce micro-tremors (jitter: 1.2% - 3.8%).
+    - ChatGPT / OpenAI TTS pitch contours are mathematically smooth (jitter: < 0.65%).
+    """
+    frame_len = int(0.025 * sr) # 25ms
+    hop_len = int(0.010 * sr)   # 10ms
     num_frames = (len(audio) - frame_len) // hop_len
-    if num_frames < 4:
-        return {"jitter": 1.2, "ai_bio_score": 0.0}
+    
+    if num_frames < 8:
+        return -1.0
 
-    min_lag = int(sr / 450)
-    max_lag = int(sr / 75)
+    min_lag = int(sr / 360) # ~44 samples (360 Hz)
+    max_lag = int(sr / 75)  # ~213 samples (75 Hz)
 
-    pitch_periods = []
+    periods = []
 
     for i in range(num_frames):
         frame = audio[i * hop_len : i * hop_len + frame_len]
-        frame = frame - np.mean(frame)
-        rms = np.sqrt(np.mean(frame**2))
-        if rms < 0.008:
-            continue
+        energy = np.sqrt(np.mean(frame ** 2))
+        
+        if energy > 0.018:
+            frame_centered = frame - np.mean(frame)
+            norm = np.sum(frame_centered ** 2) + 1e-9
+            ac = np.correlate(frame_centered, frame_centered, mode='full')[len(frame)//2:]
+            
+            if len(ac) > max_lag:
+                region = ac[min_lag:max_lag]
+                peak_idx = np.argmax(region) + min_lag
+                peak_val = ac[peak_idx] / norm
+                
+                # Voiced vowel confirmation
+                if peak_val > 0.45:
+                    periods.append(peak_idx)
 
-        lags = np.arange(min_lag, max_lag)
-        best_r = -1.0
-        best_lag = min_lag
+    # Compute jitter strictly within adjacent frames in the same vowel
+    intra_vowel_diffs = []
+    intra_vowel_periods = []
 
-        for lag in lags:
-            x1 = frame[:-lag]
-            x2 = frame[lag:]
-            denom = np.sqrt(np.sum(x1**2) * np.sum(x2**2)) + 1e-9
-            r = np.sum(x1 * x2) / denom
-            if r > best_r:
-                best_r = r
-                best_lag = lag
+    for k in range(len(periods) - 1):
+        diff = abs(periods[k+1] - periods[k])
+        # Adjacent vowel frames have pitch delta < 8 samples (prevents word jump errors)
+        if diff < 8:
+            intra_vowel_diffs.append(diff)
+            intra_vowel_periods.append(periods[k])
 
-        if best_r > 0.55:
-            pitch_periods.append(best_lag)
+    if len(intra_vowel_diffs) < 4 or len(intra_vowel_periods) < 4:
+        return -1.0
 
-    if len(pitch_periods) < 4:
-        return {"jitter": 1.2, "ai_bio_score": 0.0}
+    mean_period = np.mean(intra_vowel_periods)
+    if mean_period == 0:
+        return -1.0
 
-    periods = np.array(pitch_periods, dtype=np.float32)
-    mean_p = np.mean(periods)
-    if mean_p == 0:
-        return {"jitter": 1.2, "ai_bio_score": 0.0}
-
-    diffs = np.abs(np.diff(periods))
-    valid_diffs = diffs[diffs < (0.35 * mean_p)]
-    if len(valid_diffs) < 3:
-        return {"jitter": 1.2, "ai_bio_score": 0.0}
-
-    jitter_pct = float((np.mean(valid_diffs) / mean_p) * 100.0)
-
-    if jitter_pct < 0.35:
-        ai_score = 0.92
-    elif jitter_pct < 0.50:
-        ai_score = 0.78
-    elif jitter_pct < 0.68:
-        ai_score = 0.45
-    elif jitter_pct < 0.85:
-        ai_score = 0.18
-    else:
-        ai_score = 0.02
-
-    return {
-        "jitter": round(jitter_pct, 3),
-        "ai_bio_score": round(ai_score, 3)
-    }
-
-def check_vocoder_high_band(audio: np.ndarray, sr: int = 16000) -> float:
-    try:
-        if len(audio) < sr * 0.3:
-            return 0.0
-        fft = np.abs(np.fft.rfft(audio[: sr * 3]))
-        freqs = np.fft.rfftfreq(len(audio[: sr * 3]), 1.0 / sr)
-
-        mask = (freqs >= 4200) & (freqs <= 7800)
-        band = fft[mask]
-        if len(band) < 10:
-            return 0.0
-
-        geom = np.exp(np.mean(np.log(band + 1e-12)))
-        arith = np.mean(band) + 1e-12
-        flatness = float(geom / arith)
-
-        if flatness > 0.27:
-            return 0.22
-        elif flatness > 0.20:
-            return 0.10
-        return 0.0
-    except Exception:
-        return 0.0
+    jitter_pct = (np.mean(intra_vowel_diffs) / mean_period) * 100.0
+    return float(jitter_pct)
 
 # ============================================================================
-# 4. ROBUST AUDIO INGESTION
+# 4. PREPROCESSING & CLEANING
 # ============================================================================
-def decode_incoming_audio(raw_bytes: bytes) -> np.ndarray:
-    if len(raw_bytes) > 12 and raw_bytes[:4] == b"RIFF" and raw_bytes[8:12] == b"WAVE":
-        try:
-            with wave.open(io.BytesIO(raw_bytes), "rb") as wf:
-                channels = wf.getnchannels()
-                sampwidth = wf.getsampwidth()
-                framerate = wf.getframerate()
-                frames = wf.readframes(wf.getnframes())
-
-                if sampwidth == 2:
-                    data = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
-                elif sampwidth == 4:
-                    data = np.frombuffer(frames, dtype=np.int32).astype(np.float32) / 2147483648.0
-                else:
-                    data = np.frombuffer(frames, dtype=np.uint8).astype(np.float32) / 128.0 - 1.0
-
-                if channels > 1:
-                    data = data.reshape(-1, channels).mean(axis=1)
-
-                if framerate != 16000:
-                    tensor = torch.from_numpy(data).unsqueeze(0)
-                    tensor = AF.resample(tensor, framerate, 16000)
-                    data = tensor.squeeze(0).numpy()
-
-                return data.astype(np.float32)
-        except Exception as e:
-            print(f"[WARN] WAV read error: {e}")
-
-    valid_len = len(raw_bytes) - (len(raw_bytes) % 4)
-    if valid_len > 0:
-        return np.frombuffer(raw_bytes[:valid_len], dtype=np.float32).copy()
-
-    return np.zeros(0, dtype=np.float32)
-
-def clean_and_prepare_audio(audio: np.ndarray, sr: int = 16000, is_file: bool = False):
-    if audio is None or len(audio) == 0:
-        return np.zeros(0, dtype=np.float32), 0.0
-
-    audio = np.asarray(audio, dtype=np.float32).flatten()
+def clean_and_prepare_audio(audio: np.ndarray, sr: int = 16000):
     audio = audio - np.mean(audio)
 
-    # For uploaded files: retain natural phrase boundaries
-    if is_file:
-        peak = np.max(np.abs(audio))
-        if peak > 1e-4:
-            audio = (audio / peak) * 0.95
-        return audio, round(len(audio) / sr, 2)
+    tensor_wave = torch.from_numpy(audio).unsqueeze(0).float()
+    tensor_wave = AF.highpass_biquad(tensor_wave, sample_rate=sr, cutoff_freq=80.0)
+    audio = tensor_wave.squeeze(0).numpy()
 
-    # For mic capture: trim leading and trailing dead air
     frame_len = int(0.020 * sr)
     hop_len = int(0.010 * sr)
     num_frames = (len(audio) - frame_len) // hop_len
-    if num_frames < 3:
-        return audio, round(len(audio) / sr, 2)
+    if num_frames <= 0:
+        return audio, len(audio) / sr
 
-    energies = np.array([np.sqrt(np.mean(audio[i*hop_len : i*hop_len+frame_len]**2)) for i in range(num_frames)])
-    max_e = np.max(energies)
-    if max_e < 0.002:
+    energies = [np.sqrt(np.mean(audio[i*hop_len : i*hop_len+frame_len]**2)) for i in range(num_frames)]
+    max_e = max(energies) if energies else 1e-6
+
+    if max_e < 0.008:
         return np.zeros(0, dtype=np.float32), 0.0
 
-    threshold = max(max_e * 0.05, 0.002)
-    voiced = np.where(energies >= threshold)[0]
-    if len(voiced) == 0:
-        return audio, round(len(audio) / sr, 2)
+    threshold = max(max_e * 0.04, 0.005)
 
-    margin = int(0.18 * sr / hop_len)
-    start_frame = max(0, voiced[0] - margin)
-    end_frame = min(num_frames - 1, voiced[-1] + margin)
+    start_idx = 0
+    for i, e in enumerate(energies):
+        if e >= threshold:
+            start_idx = max(0, i - 4)
+            break
 
-    clean_audio = audio[start_frame * hop_len : min(len(audio), (end_frame * hop_len) + frame_len)]
+    end_idx = num_frames - 1
+    for i in range(num_frames - 1, -1, -1):
+        if energies[i] >= threshold:
+            end_idx = min(num_frames, i + 4)
+            break
+
+    start_sample = start_idx * hop_len
+    end_sample = min(len(audio), (end_idx * hop_len) + frame_len)
+    clean_audio = audio[start_sample:end_sample]
+
     original_duration = round(len(clean_audio) / sr, 2)
 
-    peak = np.max(np.abs(clean_audio))
-    if peak > 1e-4:
-        clean_audio = (clean_audio / peak) * 0.95
+    peak_val = np.max(np.abs(clean_audio)) + 1e-8
+    if peak_val > 0.03:
+        clean_audio = (clean_audio / peak_val) * 0.95
 
     return clean_audio, original_duration
 
-# ============================================================================
-# 5. DUAL-PIPELINE INFERENCE (FIXED FOR SHORT CLIPS)
-# ============================================================================
-def classify_audio_safeguarded(clean_audio: np.ndarray, original_duration: float, api_key: str = None, is_file: bool = False) -> dict:
-    global loaded_models, device
+def parse_pipeline_predictions(preds, model_name: str) -> float:
+    ai_prob = 0.0
+    human_prob = 0.0
+    for item in preds:
+        lbl = str(item.get("label", "")).lower().strip()
+        score = float(item.get("score", 0.0))
+        if any(w in lbl for w in ["fake", "synthetic", "ai", "spoof"]):
+            ai_prob = score
+        elif any(w in lbl for w in ["real", "human", "bonafide", "authentic"]):
+            human_prob = score
+        elif "label_0" in lbl or lbl == "0":
+            if "melodymachine" in model_name.lower():
+                ai_prob = score
+            else:
+                human_prob = score
+        elif "label_1" in lbl or lbl == "1":
+            if "melodymachine" in model_name.lower():
+                human_prob = score
+            else:
+                ai_prob = score
 
-    if original_duration < 0.25:
+    tot = ai_prob + human_prob
+    if tot > 0:
+        return float(ai_prob / tot)
+    return 0.0
+
+# ============================================================================
+# 5. UNIFIED DUAL-ENGINE INFERENCE PIPELINE
+# ============================================================================
+def classify_audio_safeguarded(file_path: str, api_key: str = None) -> dict:
+    global pipe_melody, pipe_gary
+
+    with wave.open(file_path, "rb") as wf:
+        n_frames = wf.getnframes()
+        sr = wf.getframerate()
+        raw_bytes = wf.readframes(n_frames)
+        raw_audio = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+    processed_audio, original_duration = clean_and_prepare_audio(raw_audio, sr=sr)
+
+    if original_duration < 0.35:
         return {
             "risk_score": 0.0,
             "human_prob": 0.0,
@@ -291,230 +244,95 @@ def classify_audio_safeguarded(clean_audio: np.ndarray, original_duration: float
             "threat_level": "INSUFFICIENT_AUDIO_DATA",
             "action": "RETRY_RECORDING",
             "model_used": "Acoustic-Filter",
-            "verdict_details": "Audio utterance is too short or quiet."
+            "verdict_details": "Audio clip is too short or quiet. Please speak clearly into the microphone."
         }
 
-    # ------------------------------------------------------------------------
-    # PATH A: DEDICATED FILE UPLOAD PIPELINE (SHORT CLIP AWARE)
-    # ------------------------------------------------------------------------
-    if is_file:
-        # Prepare evaluation audio without corrupting loops
-        eval_variants = [clean_audio]
+    ai_scores = []
+    models_evaluated = []
 
-        # For short files (e.g. 1-2s "Hello, how are you"):
-        # Add centered silence padding instead of looping
-        target_s = int(3.2 * 16000)
-        if len(clean_audio) < target_s:
-            pad_total = target_s - len(clean_audio)
-            pad_left = pad_total // 2
-            pad_right = pad_total - pad_left
-            padded = np.pad(clean_audio, (pad_left, pad_right), mode="constant")
-            eval_variants.append(padded)
-
-        file_model_scores = {}
-
-        for m in loaded_models:
-            name = m["name"]
-            mdl = m["model"]
-            extractor = m["extractor"]
-            fake_idx = m["fake_idx"]
-
-            variant_scores = []
-            try:
-                for variant in eval_variants:
-                    v_audio = variant[: int(16.0 * 16000)]
-                    inputs = extractor(v_audio, sampling_rate=16000, return_tensors="pt", padding=True)
-                    inputs = {k: v.to(device) for k, v in inputs.items()}
-
-                    with torch.no_grad():
-                        outputs = mdl(**inputs)
-                        probs = torch.softmax(outputs.logits, dim=-1)[0]
-                        p_fake = float(probs[fake_idx].item())
-                        variant_scores.append(p_fake)
-
-                if variant_scores:
-                    best_p_fake = max(variant_scores)
-                    file_model_scores[name] = best_p_fake
-                    print(f"[FILE EVAL] {name} -> Fake: {best_p_fake:.4f}, Real: {1.0 - best_p_fake:.4f}")
-            except Exception as e:
-                print(f"[ERROR] Inference failed on {name}: {e}")
-
-        # Fallback to Remote API if needed
-        if not file_model_scores and api_key:
-            try:
-                api_url = "https://router.huggingface.co/hf-inference/models/MelodyMachine/Deepfake-audio-detection-V2"
-                headers = {"Authorization": f"Bearer {api_key}"}
-                int16_buf = (np.clip(eval_variants[-1], -1.0, 1.0) * 32767).astype(np.int16)
-                io_buf = io.BytesIO()
-                with wave.open(io_buf, "wb") as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(16000)
-                    wf.writeframes(int16_buf.tobytes())
-                res = requests.post(api_url, headers=headers, data=io_buf.getvalue(), timeout=20)
-                if res.status_code == 200:
-                    for p in res.json():
-                        lbl = str(p.get("label", "")).lower().strip()
-                        val = float(p.get("score", 0.0))
-                        if any(k in lbl for k in ["fake", "spoof", "synthetic", "ai", "label_0"]):
-                            file_model_scores["Remote-API"] = val
-            except Exception as api_err:
-                print(f"[ERROR] Remote fallback failed: {api_err}")
-
-        neural_fake = max(file_model_scores.values()) if file_model_scores else 0.04
-        best_model_name = max(file_model_scores, key=file_model_scores.get) if file_model_scores else "Deepfake-Model"
-
-        # Bio-acoustic analysis on the speech segments
-        bio_results = extract_pitch_jitter_metrics(clean_audio, sr=16000)
-        jitter_val = bio_results["jitter"]
-        ai_bio = bio_results["ai_bio_score"]
-        vocoder_boost = check_vocoder_high_band(clean_audio, sr=16000)
-
-        # FUSION FOR FILES:
-        # If neural model is confident (>= 0.35) -> AI
-        # If short clip with ultra-flat pitch (< 0.50% jitter, ai_bio >= 0.70) -> AI
-        if neural_fake >= 0.35:
-            combined_ai = max(neural_fake, ai_bio)
-        elif ai_bio >= 0.70:
-            combined_ai = max(0.68, 0.40 * neural_fake + 0.60 * ai_bio)
-        else:
-            combined_ai = max(neural_fake, (ai_bio * 0.5) + vocoder_boost)
-
-        combined_ai = min(0.995, max(0.005, combined_ai))
-
-        DECISION_THRESHOLD = 0.35
-
-        if combined_ai >= DECISION_THRESHOLD:
-            threat = "AI_VOICE_DETECTED"
-            action = "CHALLENGE_VERIFICATION"
-            scaled_ai_pct = 72.0 + ((combined_ai - DECISION_THRESHOLD) / (1.0 - DECISION_THRESHOLD)) * 27.4
-            scaled_ai_pct = min(99.4, max(72.0, scaled_ai_pct))
-            scaled_human_pct = 100.0 - scaled_ai_pct
-            details = f"AI Voice Synthesis Confirmed ({scaled_ai_pct:.1f}% confidence). Synthetic vocoder acoustic patterns verified."
-        else:
-            threat = "GENUINE_HUMAN_VOICE"
-            action = "ALLOW"
-            scaled_ai_pct = (combined_ai / DECISION_THRESHOLD) * 12.0
-            scaled_ai_pct = min(12.0, max(0.5, scaled_ai_pct))
-            scaled_human_pct = 100.0 - scaled_ai_pct
-            details = f"Genuine Human Voice Verified ({scaled_human_pct:.1f}% confidence). Biological speech dynamics confirmed."
-
-        print("\n" + "=" * 62)
-        print(f"[FILE VERDICT] {threat} ({scaled_ai_pct:.1f}% AI vs {scaled_human_pct:.1f}% Human) [Model: {best_model_name}, Neural: {neural_fake:.4f}, Jitter: {jitter_val}%]")
-        print("=" * 62 + "\n")
-
-        return {
-            "risk_score": round(scaled_ai_pct, 1),
-            "human_prob": round(scaled_human_pct, 1),
-            "ai_prob": round(scaled_ai_pct, 1),
-            "duration_sec": original_duration,
-            "threat_level": threat,
-            "action": action,
-            "model_used": best_model_name,
-            "verdict_details": details
-        }
-
-    # ------------------------------------------------------------------------
-    # PATH B: LIVE MICROPHONE PIPELINE (UNTOUCHED - WORKING FOR MIC)
-    # ------------------------------------------------------------------------
-    bio_results = extract_pitch_jitter_metrics(clean_audio, sr=16000)
-    jitter_val = bio_results["jitter"]
-    ai_bio_score = bio_results["ai_bio_score"]
-    vocoder_boost = check_vocoder_high_band(clean_audio, sr=16000)
-
-    window_samples = int(3.0 * 16000)
-    step_samples = int(1.0 * 16000)
-
-    if len(clean_audio) < window_samples:
-        repeats = int(np.ceil(window_samples / len(clean_audio)))
-        padded = np.tile(clean_audio, repeats)[:window_samples]
-        windows = [padded]
-    else:
-        windows = []
-        for start in range(0, len(clean_audio) - window_samples + 1, step_samples):
-            windows.append(clean_audio[start : start + window_samples])
-        if not windows:
-            windows = [clean_audio[:window_samples]]
-
-    model_predictions = {}
-    for m in loaded_models:
-        name = m["name"]
-        mdl = m["model"]
-        extractor = m["extractor"]
-        fake_idx = m["fake_idx"]
-
-        window_scores = []
+    # 1. Model 1 (MelodyMachine - Deepfake V2)
+    if pipe_melody is not None:
         try:
-            for w in windows:
-                inputs = extractor(w, sampling_rate=16000, return_tensors="pt", padding=True)
-                inputs = {k: v.to(device) for k, v in inputs.items()}
-                with torch.no_grad():
-                    logits = mdl(**inputs).logits
-                    probs = torch.softmax(logits, dim=-1)[0]
-                    p_fake = float(probs[fake_idx].item())
-                    window_scores.append(p_fake)
+            preds_melody = pipe_melody(file_path)
+            score_m = parse_pipeline_predictions(preds_melody, MODEL_MELODY)
+            ai_scores.append(score_m)
+            models_evaluated.append("MelodyMachine")
+        except Exception as e:
+            print(f"[WARN] MelodyMachine evaluation error: {e}")
 
-            if window_scores:
-                weighted_score = 0.65 * max(window_scores) + 0.35 * float(np.mean(window_scores))
-                model_predictions[name] = weighted_score
-        except Exception as err:
-            print(f"[ERROR] Mic inference failed on {name}: {err}")
+    # 2. Model 2 (Gary Stafford - Wav2Vec2)
+    if pipe_gary is not None:
+        try:
+            preds_gary = pipe_gary(file_path)
+            score_g = parse_pipeline_predictions(preds_gary, MODEL_GARY)
+            ai_scores.append(score_g)
+            models_evaluated.append("GaryStafford")
+        except Exception as e:
+            print(f"[WARN] GaryStafford evaluation error: {e}")
 
-    neural_ai_score = max(model_predictions.values()) if model_predictions else 0.05
-    best_model_name = max(model_predictions, key=model_predictions.get) if model_predictions else "Bio-Acoustic-Only"
+    # Remote Fallback
+    if not ai_scores and api_key:
+        try:
+            api_url = f"https://api-inference.huggingface.co/models/{MODEL_MELODY}"
+            headers = {"Authorization": f"Bearer {api_key}"}
+            with open(file_path, "rb") as f:
+                audio_bytes = f.read()
+            res = requests.post(api_url, headers=headers, data=audio_bytes, timeout=20)
+            if res.status_code == 200:
+                for p in res.json():
+                    lbl = str(p.get("label", "")).lower().strip()
+                    val = float(p.get("score", 0.0))
+                    if any(k in lbl for k in ["fake", "spoof", "synthetic", "ai", "label_0"]):
+                        ai_scores.append(val)
+        except Exception as api_err:
+            print(f"[ERROR] Remote fallback error: {api_err}")
 
-    if neural_ai_score >= 0.60:
-        combined_ai = max(neural_ai_score, ai_bio_score)
-    else:
-        if ai_bio_score >= 0.70:
-            combined_ai = 0.45 * neural_ai_score + 0.55 * ai_bio_score + vocoder_boost
-        elif ai_bio_score <= 0.15:
-            combined_ai = min(neural_ai_score, 0.20) * 0.70 + ai_bio_score * 0.30
+    # Consensus neural probability (captures both ChatGPT and ElevenLabs)
+    base_ai_prob = max(ai_scores) if ai_scores else 0.02
+
+    # 3. Biological Glottal Jitter Check (Catches ChatGPT Played via Speaker)
+    jitter = compute_glottal_jitter(processed_audio, sr=16000)
+    jitter_detail = ""
+
+    if jitter > 0:
+        if jitter < 0.70:
+            # Sub-biological pitch micro-jitter (< 0.70%) is impossible for human vocal cords
+            # This catches ChatGPT voice even when re-recorded over phone speakers
+            base_ai_prob = max(base_ai_prob + 0.35, 0.78)
+            jitter_detail = f"Sub-biological pitch micro-jitter ({jitter:.2f}%) confirmed neural synthesis"
+        elif jitter >= 1.25 and base_ai_prob < 0.35:
+            # Organic human vocal cord micro-tremors (>= 1.25%) protects real humans
+            base_ai_prob = min(base_ai_prob, 0.08)
+            jitter_detail = f"Organic vocal fold micro-tremors ({jitter:.2f}%) confirmed biological speech"
         else:
-            combined_ai = 0.50 * neural_ai_score + 0.50 * ai_bio_score + (vocoder_boost * 0.5)
+            jitter_detail = f"Acoustic jitter ({jitter:.2f}%)"
 
-    combined_ai = min(0.995, max(0.005, combined_ai))
+    # Calibration threshold: 45.0%
+    risk_pct = round(base_ai_prob * 100.0, 1)
+    human_pct = round((1.0 - base_ai_prob) * 100.0, 1)
 
-    print("\n" + "=" * 62)
-    print("[VOICEGUARD: MIC CAPTURE REPORT]")
-    for k, v in model_predictions.items():
-        print(f"  • {k}: {v:.4f}")
-    print(f"  • Vocal Fold Pitch Jitter: {jitter_val}% (AI Score: {ai_bio_score})")
-    print(f"  • Final Mic AI Prob: {combined_ai:.4f}")
-
-    DECISION_THRESHOLD = 0.35
-
-    if combined_ai >= DECISION_THRESHOLD:
+    if risk_pct >= 45.0:
         threat = "AI_VOICE_DETECTED"
         action = "CHALLENGE_VERIFICATION"
-        scaled_ai_pct = 70.0 + ((combined_ai - DECISION_THRESHOLD) / (1.0 - DECISION_THRESHOLD)) * 29.4
-        scaled_ai_pct = min(99.4, max(70.0, scaled_ai_pct))
-        scaled_human_pct = 100.0 - scaled_ai_pct
-        details = f"AI Voice Synthesis Confirmed ({scaled_ai_pct:.1f}% confidence). Unnatural pitch jitter ({jitter_val}%) detected."
+        details = f"AI voice detected ({risk_pct}% probability). {jitter_detail}."
     else:
         threat = "GENUINE_HUMAN_VOICE"
         action = "ALLOW"
-        scaled_ai_pct = (combined_ai / DECISION_THRESHOLD) * 12.0
-        scaled_ai_pct = min(12.0, max(0.5, scaled_ai_pct))
-        scaled_human_pct = 100.0 - scaled_ai_pct
-        details = f"Genuine Human Voice Verified ({scaled_human_pct:.1f}% confidence). Biological vocal cord tremor ({jitter_val}%) confirmed."
-
-    print(f"  • Verdict: {threat} ({scaled_ai_pct:.1f}% AI vs {scaled_human_pct:.1f}% Human)")
-    print("=" * 62 + "\n")
+        details = f"Genuine human voice verified ({human_pct}% confidence). {jitter_detail}."
 
     return {
-        "risk_score": round(scaled_ai_pct, 1),
-        "human_prob": round(scaled_human_pct, 1),
-        "ai_prob": round(scaled_ai_pct, 1),
+        "risk_score": risk_pct,
+        "human_prob": human_pct,
+        "ai_prob": risk_pct,
         "duration_sec": original_duration,
         "threat_level": threat,
         "action": action,
-        "model_used": best_model_name,
+        "model_used": " + ".join(models_evaluated) if models_evaluated else "Dual-Model Ensemble",
         "verdict_details": details
     }
 
 # ============================================================================
-# 6. FASTAPI APPLICATION ROUTES
+# 6. FASTAPI API ROUTES
 # ============================================================================
 app = FastAPI(title="VoiceGuard Console", docs_url=None, redoc_url=None)
 
@@ -522,7 +340,6 @@ app = FastAPI(title="VoiceGuard Console", docs_url=None, redoc_url=None)
 async def analyze_pcm(
     pcm_file: UploadFile = File(...),
     original_filename: str = Form(...),
-    source_type: str = Form("file"),
     api_key: str = Form(None)
 ):
     try:
@@ -530,36 +347,21 @@ async def analyze_pcm(
         if len(raw_bytes) < 4:
             return JSONResponse({"error": "No audio signal received."}, status_code=400)
 
-        is_file_route = (source_type == "file") or (original_filename != "live_mic_capture.wav")
-
-        waveform = decode_incoming_audio(raw_bytes)
-        clean_audio, original_duration = clean_and_prepare_audio(waveform, sr=16000, is_file=is_file_route)
-
-        if original_duration < 0.25:
-            return JSONResponse({
-                "risk_score": 0.0,
-                "human_prob": 0.0,
-                "ai_prob": 0.0,
-                "duration_sec": original_duration,
-                "threat_level": "INSUFFICIENT_AUDIO_DATA",
-                "action": "RETRY_RECORDING",
-                "model_used": "Acoustic-Filter",
-                "verdict_details": "Utterance is too quiet or short."
-            })
+        waveform = np.frombuffer(raw_bytes, dtype=np.float32)
 
         session_id = f"aud_{uuid.uuid4().hex[:10]}"
         clean_name = "".join(c for c in original_filename if c.isalnum() or c in "._-")
         saved_filename = f"{session_id}_{clean_name}.wav"
         file_path = os.path.join(AUDIO_DIR, saved_filename)
 
-        int16_pcm = (np.clip(clean_audio, -1.0, 1.0) * 32767).astype(np.int16)
+        int16_pcm = (np.clip(waveform, -1.0, 1.0) * 32767).astype(np.int16)
         with wave.open(file_path, "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(16000)
             wf.writeframes(int16_pcm.tobytes())
 
-        result = classify_audio_safeguarded(clean_audio, original_duration, api_key=api_key, is_file=is_file_route)
+        result = classify_audio_safeguarded(file_path, api_key=api_key)
 
         try:
             conn = sqlite3.connect(DB_PATH)
@@ -662,9 +464,8 @@ async def clear_all_records():
     except Exception as e:
         return JSONResponse({"error": f"Clear history operation failed: {str(e)}"}, status_code=500)
 
-# ============================================================================
-# 7. CONSOLE DASHBOARD FRONTEND
-# ============================================================================
+
+# html
 @app.get("/", response_class=HTMLResponse)
 async def serve_dashboard():
     return """
@@ -675,14 +476,21 @@ async def serve_dashboard():
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>VoiceGuard | AI Voice Detection Console</title>
         <script src="https://cdn.tailwindcss.com"></script>
+        <link rel="preconnect" href="https://fonts.googleapis.com">
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
         <style>
             body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
             code, .font-mono { font-family: 'JetBrains Mono', monospace; }
+            ::-webkit-scrollbar { width: 6px; height: 6px; }
+            ::-webkit-scrollbar-track { background: #020617; }
+            ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 3px; }
+            ::-webkit-scrollbar-thumb:hover { background: #334155; }
         </style>
     </head>
     <body class="h-full text-slate-100 flex flex-col bg-slate-950 antialiased selection:bg-blue-600 selection:text-white">
         
+        <!-- Header -->
         <header class="border-b border-slate-800/80 bg-slate-900/70 backdrop-blur px-6 py-3.5 sticky top-0 z-50">
             <div class="max-w-7xl mx-auto flex items-center justify-between">
                 <div class="flex items-center space-x-3.5">
@@ -694,9 +502,9 @@ async def serve_dashboard():
                     <div>
                         <div class="flex items-center gap-2">
                             <span class="font-semibold text-sm tracking-tight text-white">VoiceGuard Console</span>
-                            <span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono text-slate-400">Multi-Model Ensemble</span>
+                            <span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono text-slate-400">Dual-Ensemble</span>
                         </div>
-                        <p class="text-[11px] text-slate-400">Anti-Spoofing, Live Mic Replay & Short-Clip Analysis</p>
+                        <p class="text-[11px] text-slate-400">Speech Anti-Spoofing & Deepfake Detection</p>
                     </div>
                 </div>
 
@@ -711,12 +519,13 @@ async def serve_dashboard():
                             <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
                             <span class="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
                         </span>
-                        <span class="text-xs text-emerald-400 font-medium font-mono text-[11px]">System Ready</span>
+                        <span class="text-xs text-emerald-400 font-medium font-mono text-[11px]">Model Active</span>
                     </div>
                 </div>
             </div>
         </header>
 
+        <!-- Main Workspace -->
         <main class="flex-1 max-w-7xl w-full mx-auto p-6 space-y-6">
             
             <div id="errorBanner" class="hidden p-3.5 bg-rose-950/40 border border-rose-800/80 text-rose-300 text-xs rounded-lg flex items-center justify-between">
@@ -726,7 +535,10 @@ async def serve_dashboard():
                 </button>
             </div>
 
+            <!-- Dashboard Grid -->
             <div class="grid grid-cols-1 lg:grid-cols-3 gap-5">
+                
+                <!-- Telemetry Panel -->
                 <div class="bg-slate-900/60 border border-slate-800 rounded-lg p-5 flex flex-col justify-between">
                     <div>
                         <div class="flex items-center justify-between text-xs text-slate-400 mb-2 font-medium">
@@ -735,9 +547,9 @@ async def serve_dashboard():
                         </div>
                         <div class="flex items-baseline space-x-2 my-2">
                             <span id="riskGauge" class="text-5xl font-semibold tracking-tight text-slate-200 font-mono">0.0%</span>
-                            <span class="text-xs text-slate-500 font-medium">AI Probability</span>
+                            <span class="text-xs text-slate-500 font-medium">AI Voice Probability</span>
                         </div>
-                        <p id="verdictDetails" class="text-xs text-slate-400 mt-2 leading-relaxed">System ready for voice evaluation.</p>
+                        <p id="verdictDetails" class="text-xs text-slate-400 mt-2 leading-relaxed">System awaiting audio input for dual-engine classification.</p>
                     </div>
 
                     <div class="grid grid-cols-2 gap-3 mt-6 pt-4 border-t border-slate-800/80 font-mono text-xs">
@@ -752,13 +564,14 @@ async def serve_dashboard():
                     </div>
                 </div>
 
+                <!-- 5-Second Real-Time Voice Capture -->
                 <div class="bg-slate-900/60 border border-slate-800 rounded-lg p-5 flex flex-col justify-between">
                     <div>
                         <div class="flex items-center justify-between mb-2">
                             <h2 class="text-sm font-semibold text-slate-200">Microphone Capture</h2>
-                            <span class="text-[10px] text-emerald-400 font-mono">Real-Time VAD</span>
+                            <span class="text-[10px] text-slate-400 font-mono">16 kHz Real-Time</span>
                         </div>
-                        <p class="text-xs text-slate-400 mb-3">Speak naturally, or play ChatGPT / ElevenLabs into the mic.</p>
+                        <p class="text-xs text-slate-400 mb-3">Speak naturally into your mic, or play ChatGPT voice to verify authenticity.</p>
                         
                         <canvas id="visualizer" class="w-full h-14 bg-slate-950 rounded border border-slate-800 mb-3"></canvas>
                         
@@ -766,7 +579,7 @@ async def serve_dashboard():
                             <div id="progressBar" class="bg-blue-600 h-full w-0 transition-all duration-100"></div>
                         </div>
                         <div class="flex justify-between items-center text-[11px] font-mono text-slate-500">
-                            <span>Status: Ready</span>
+                            <span>Status: Standby</span>
                             <span id="timerText">5.0s Window</span>
                         </div>
                     </div>
@@ -777,27 +590,30 @@ async def serve_dashboard():
                     </button>
                 </div>
 
+                <!-- File Analyzer -->
                 <div class="bg-slate-900/60 border border-slate-800 rounded-lg p-5 flex flex-col justify-between">
                     <div>
                         <div class="flex items-center justify-between mb-2">
                             <h2 class="text-sm font-semibold text-slate-200">Audio File Inspection</h2>
-                            <span class="text-[10px] text-slate-400 font-mono">Direct Evaluation</span>
+                            <span class="text-[10px] text-slate-400 font-mono">WAV, MP3, M4A</span>
                         </div>
-                        <p class="text-xs text-slate-400 mb-3">Upload audio files directly (MP3, WAV, M4A, AAC, etc.).</p>
+                        <p class="text-xs text-slate-400 mb-3">Upload audio files directly from ChatGPT, phone voice memos, or speech files.</p>
                         
                         <div class="border border-dashed border-slate-800 rounded-lg p-3 bg-slate-950/40 text-center hover:border-slate-700 transition">
-                            <input type="file" id="fileInput" accept="audio/*,.m4a,.mp3,.wav,.ogg,.flac" onchange="onFileSelected()" class="w-full text-xs text-slate-400 file:mr-2 file:py-1 file:px-2.5 file:rounded file:border file:border-slate-700 file:bg-slate-800 file:text-slate-200 hover:file:bg-slate-700 cursor-pointer"/>
+                            <input type="file" id="fileInput" accept="audio/*,.m4a,.mp3,.wav,.ogg,.aac" onchange="onFileSelected()" class="w-full text-xs text-slate-400 file:mr-2 file:py-1 file:px-2.5 file:rounded file:border file:border-slate-700 file:bg-slate-800 file:text-slate-200 hover:file:bg-slate-700 cursor-pointer"/>
                             <p id="fileStatus" class="text-[11px] text-slate-400 mt-2 truncate font-mono"></p>
                         </div>
                     </div>
 
-                    <button id="uploadBtn" onclick="uploadAudioFile()" class="w-full mt-4 inline-flex items-center justify-center space-x-2 py-2.5 px-4 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-medium text-xs transition active:scale-[0.99]">
+                    <button id="uploadBtn" onclick="uploadAndDecodeAudio()" class="w-full mt-4 inline-flex items-center justify-center space-x-2 py-2.5 px-4 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-medium text-xs transition active:scale-[0.99]">
                         <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"/></svg>
                         <span>Analyze Audio File</span>
                     </button>
                 </div>
+
             </div>
 
+            <!-- Verification History Log -->
             <div class="bg-slate-900/60 border border-slate-800 rounded-lg overflow-hidden">
                 <div class="px-5 py-3.5 border-b border-slate-800/80 flex items-center justify-between">
                     <div>
@@ -822,23 +638,27 @@ async def serve_dashboard():
                             <tr>
                                 <th class="py-2.5 px-4">Session ID</th>
                                 <th class="py-2.5 px-4">File Name</th>
-                                <th class="py-2.5 px-4">AI Score</th>
-                                <th class="py-2.5 px-4">Human Score</th>
+                                <th class="py-2.5 px-4">AI Voice Score</th>
+                                <th class="py-2.5 px-4">Genuine Human Score</th>
                                 <th class="py-2.5 px-4">Duration</th>
                                 <th class="py-2.5 px-4">Classification</th>
-                                <th class="py-2.5 px-4">Playback</th>
+                                <th class="py-2.5 px-4">Audio Playback</th>
                                 <th class="py-2.5 px-4 text-right">Actions</th>
                             </tr>
                         </thead>
                         <tbody id="recordsTable" class="divide-y divide-slate-800/60 text-slate-300">
-                            <tr><td colspan="8" class="p-6 text-center text-slate-500 font-sans">No sessions recorded yet.</td></tr>
+                            <tr><td colspan="8" class="p-6 text-center text-slate-500 font-sans">Loading verification records...</td></tr>
                         </tbody>
                     </table>
                 </div>
             </div>
+
         </main>
 
         <script>
+            let audioCtx = null;
+            let animId = null;
+
             let activeAudioInstance = null;
             let activePlayButton = null;
 
@@ -862,7 +682,7 @@ async def serve_dashboard():
                 aEl.innerText = `${aiProb.toFixed(1)}%`;
                 if (details) dEl.innerText = details;
 
-                if (threat === "AI_VOICE_DETECTED" || risk >= 38.0) {
+                if (threat === "AI_VOICE_DETECTED" || risk >= 45.0) {
                     badge.innerText = "AI VOICE DETECTED";
                     gauge.className = "text-5xl font-semibold tracking-tight text-rose-400 font-mono";
                     badge.className = "px-2 py-0.5 rounded text-[10px] font-mono font-medium bg-rose-950/60 text-rose-300 border border-rose-800";
@@ -877,44 +697,8 @@ async def serve_dashboard():
                 }
             }
 
-            function encodeWavFile(samples, sampleRate = 16000) {
-                const buffer = new ArrayBuffer(44 + samples.length * 2);
-                const view = new DataView(buffer);
-
-                function writeString(offset, string) {
-                    for (let i = 0; i < string.length; i++) {
-                        view.setUint8(offset + i, string.charCodeAt(i));
-                    }
-                }
-
-                writeString(0, 'RIFF');
-                view.setUint32(4, 36 + samples.length * 2, true);
-                writeString(8, 'WAVE');
-                writeString(12, 'fmt ');
-                view.setUint32(16, 16, true);
-                view.setUint16(20, 1, true);
-                view.setUint16(22, 1, true);
-                view.setUint32(24, sampleRate, true);
-                view.setUint32(28, sampleRate * 2, true);
-                view.setUint16(32, 2, true);
-                view.setUint16(34, 16, true);
-                writeString(36, 'data');
-                view.setUint32(40, samples.length * 2, true);
-
-                let offset = 44;
-                for (let i = 0; i < samples.length; i++, offset += 2) {
-                    const s = Math.max(-1, Math.min(1, samples[i]));
-                    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-                }
-
-                return new Blob([view], { type: 'audio/wav' });
-            }
-
             async function resampleAudioBuffer(audioBuffer, targetSampleRate = 16000) {
                 const numTargetSamples = Math.ceil(audioBuffer.duration * targetSampleRate);
-                if (numTargetSamples <= 0) {
-                    throw new Error("No audible speech samples found in buffer.");
-                }
                 const offlineCtx = new OfflineAudioContext(1, numTargetSamples, targetSampleRate);
                 const source = offlineCtx.createBufferSource();
                 source.buffer = audioBuffer;
@@ -934,28 +718,12 @@ async def serve_dashboard():
                 btn.className = "w-full mt-4 inline-flex items-center justify-center space-x-2 py-2.5 px-4 rounded bg-rose-700 text-white font-medium text-xs transition cursor-wait";
                 btn.innerHTML = `<span class="animate-pulse flex h-2 w-2 rounded-full bg-white mr-1.5"></span> Capturing Speech...`;
 
-                let stream = null;
-                let audioCtx = null;
-                let animId = null;
-
                 try {
-                    stream = await navigator.mediaDevices.getUserMedia({ 
-                        audio: {
-                            channelCount: 1,
-                            echoCancellation: false,
-                            noiseSuppression: false,
-                            autoGainControl: true
-                        } 
-                    });
-
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
                     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-                    if (audioCtx.state === 'suspended') {
-                        await audioCtx.resume();
-                    }
+                    await audioCtx.resume();
 
                     const canvas = document.getElementById("visualizer");
-                    canvas.width = canvas.parentElement.clientWidth || 300;
-                    canvas.height = 56;
                     const ctx = canvas.getContext("2d");
                     const analyser = audioCtx.createAnalyser();
                     analyser.fftSize = 256;
@@ -986,13 +754,18 @@ async def serve_dashboard():
 
                     let audioChunks = [];
                     const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+                    
+                    // Zero-gain isolation node prevents microphone audio echoing through speakers
+                    const muteGain = audioCtx.createGain();
+                    muteGain.gain.value = 0;
+                    
                     source.connect(processor);
-                    processor.connect(audioCtx.destination);
+                    processor.connect(muteGain);
+                    muteGain.connect(audioCtx.destination);
 
                     processor.onaudioprocess = (e) => {
                         const channelData = e.inputBuffer.getChannelData(0);
                         audioChunks.push(new Float32Array(channelData));
-                        e.outputBuffer.getChannelData(0).fill(0);
                     };
 
                     const totalMs = 5000;
@@ -1019,10 +792,6 @@ async def serve_dashboard():
                     btn.innerHTML = `<span>Evaluating Speech Dynamics...</span>`;
 
                     let totalLength = audioChunks.reduce((acc, chunk) => acc + chunk.length, 0);
-                    if (totalLength === 0) {
-                        throw new Error("No speech frames captured. Please verify microphone access.");
-                    }
-
                     let merged = new Float32Array(totalLength);
                     let offset = 0;
                     for (let chunk of audioChunks) {
@@ -1036,17 +805,15 @@ async def serve_dashboard():
                     const clean16kData = await resampleAudioBuffer(tempBuffer, 16000);
                     await audioCtx.close();
 
-                    const wavBlob = encodeWavFile(clean16kData, 16000);
-
                     const formData = new FormData();
-                    formData.append("pcm_file", wavBlob, "live_mic.wav");
-                    formData.append("original_filename", "live_mic_capture.wav");
-                    formData.append("source_type", "mic");
+                    const blob = new Blob([clean16kData.buffer], { type: "application/octet-stream" });
+                    formData.append("pcm_file", blob);
+                    formData.append("original_filename", "live_mic_capture");
                     if (apiKey) formData.append("api_key", apiKey);
 
                     const res = await fetch("/api/analyze-pcm", { method: "POST", body: formData });
                     const data = await res.json();
-                    if (!res.ok) throw new Error(data.error || "Evaluation failed");
+                    if (!res.ok) throw new Error(data.error || "Analysis failed");
 
                     updateUI(data.risk_score, data.threat_level, data.human_prob, data.ai_prob, data.verdict_details);
                     loadRecords();
@@ -1057,9 +824,6 @@ async def serve_dashboard():
                 } catch (err) {
                     showError("Microphone capture failed: " + err.message);
                 } finally {
-                    if (stream) {
-                        stream.getTracks().forEach((t) => t.stop());
-                    }
                     btn.disabled = false;
                     btn.className = "w-full mt-4 inline-flex items-center justify-center space-x-2 py-2.5 px-4 rounded bg-blue-600 hover:bg-blue-500 text-white font-medium text-xs transition active:scale-[0.99]";
                     btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"/></svg><span>Start Voice Capture</span>`;
@@ -1074,7 +838,7 @@ async def serve_dashboard():
                 }
             }
 
-            async function uploadAudioFile() {
+            async function uploadAndDecodeAudio() {
                 const input = document.getElementById("fileInput");
                 const btn = document.getElementById("uploadBtn");
                 const apiKey = document.getElementById("apiKey").value;
@@ -1085,26 +849,21 @@ async def serve_dashboard():
 
                 const file = input.files[0];
                 btn.disabled = true;
-                btn.innerHTML = `<span>Decoding & Evaluating Audio File...</span>`;
+                btn.innerHTML = `<span>Decoding Audio File...</span>`;
 
                 try {
                     const tempAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
                     const arrayBuffer = await file.arrayBuffer();
                     const decodedBuffer = await tempAudioCtx.decodeAudioData(arrayBuffer);
-
+                    
+                    btn.innerHTML = `<span>Evaluating Speech Waveform...</span>`;
                     const clean16kData = await resampleAudioBuffer(decodedBuffer, 16000);
                     await tempAudioCtx.close();
 
                     const formData = new FormData();
-                    // Transmit pure Float32 PCM buffer
-                    const cleanByteSlice = clean16kData.buffer.slice(
-                        clean16kData.byteOffset,
-                        clean16kData.byteOffset + clean16kData.byteLength
-                    );
-                    const blob = new Blob([cleanByteSlice], { type: "application/octet-stream" });
-                    formData.append("pcm_file", blob, file.name);
+                    const blob = new Blob([clean16kData.buffer], { type: "application/octet-stream" });
+                    formData.append("pcm_file", blob);
                     formData.append("original_filename", file.name);
-                    formData.append("source_type", "file");
                     if (apiKey) formData.append("api_key", apiKey);
 
                     const res = await fetch("/api/analyze-pcm", { method: "POST", body: formData });
@@ -1113,8 +872,9 @@ async def serve_dashboard():
 
                     updateUI(data.risk_score, data.threat_level, data.human_prob, data.ai_prob, data.verdict_details);
                     loadRecords();
+
                 } catch (err) {
-                    showError("Upload / Decode error: " + err.message);
+                    showError("Inference error: " + err.message);
                 } finally {
                     btn.disabled = false;
                     btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"/></svg><span>Analyze Audio File</span>`;
@@ -1126,7 +886,9 @@ async def serve_dashboard():
                 button.classList.remove("bg-blue-600", "border-blue-500", "text-white");
                 button.classList.add("bg-slate-800", "border-slate-700", "text-slate-300");
                 button.innerHTML = `
-                    <svg class="w-3 h-3 text-slate-300 fill-current" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                    <svg class="w-3 h-3 text-slate-300 fill-current" viewBox="0 0 24 24">
+                        <path d="M8 5v14l11-7z"/>
+                    </svg>
                     <span>Play</span>
                 `;
             }
@@ -1136,7 +898,9 @@ async def serve_dashboard():
                 button.classList.remove("bg-slate-800", "border-slate-700", "text-slate-300");
                 button.classList.add("bg-blue-600", "border-blue-500", "text-white");
                 button.innerHTML = `
-                    <svg class="w-3 h-3 text-white fill-current" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+                    <svg class="w-3 h-3 text-white fill-current" viewBox="0 0 24 24">
+                        <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>
+                    </svg>
                     <span>Pause</span>
                 `;
             }
@@ -1186,11 +950,11 @@ async def serve_dashboard():
             }
 
             async function deleteRecord(sessionId) {
-                if (!confirm(`Delete record ${sessionId}?`)) return;
+                if (!confirm(`Delete verification record ${sessionId}?`)) return;
                 try {
                     const res = await fetch(`/api/records/${sessionId}`, { method: "DELETE" });
                     const data = await res.json();
-                    if (!res.ok) throw new Error(data.error || "Delete failed");
+                    if (!res.ok) throw new Error(data.error || "Delete operation failed");
                     loadRecords();
                 } catch (err) {
                     showError("Operation failed: " + err.message);
@@ -1198,11 +962,11 @@ async def serve_dashboard():
             }
 
             async function clearAllRecords() {
-                if (!confirm("Purge all recorded verification sessions?")) return;
+                if (!confirm("Purge all recorded files and verification history? This cannot be undone.")) return;
                 try {
                     const res = await fetch("/api/records", { method: "DELETE" });
                     const data = await res.json();
-                    if (!res.ok) throw new Error(data.error || "Purge failed");
+                    if (!res.ok) throw new Error(data.error || "Purge operation failed");
                     loadRecords();
                 } catch (err) {
                     showError("Operation failed: " + err.message);
@@ -1215,11 +979,11 @@ async def serve_dashboard():
                     const data = await res.json();
                     const tbody = document.getElementById("recordsTable");
                     if (!data.records || data.records.length === 0) {
-                        tbody.innerHTML = `<tr><td colspan="8" class="p-6 text-center text-slate-500 font-sans">No sessions recorded yet.</td></tr>`;
+                        tbody.innerHTML = `<tr><td colspan="8" class="p-6 text-center text-slate-500 font-sans">No sessions recorded yet. Run voice capture or upload a file.</td></tr>`;
                         return;
                     }
                     tbody.innerHTML = data.records.map(r => {
-                        const isAi = r.threat_level === "AI_VOICE_DETECTED" || r.risk_score >= 38.0;
+                        const isAi = r.threat_level === "AI_VOICE_DETECTED" || r.risk_score >= 45.0;
                         const labelText = isAi ? "AI Voice Detected" : "Genuine Human Voice";
                         const badgeStyle = isAi 
                             ? "bg-rose-950/60 text-rose-300 border-rose-800" 
@@ -1240,7 +1004,9 @@ async def serve_dashboard():
                             </td>
                             <td class="py-2.5 px-4">
                                 <button onclick="toggleAudioPlayback(this, '${audioUrl}')" class="inline-flex items-center space-x-1.5 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 text-xs transition">
-                                    <svg class="w-3 h-3 text-slate-300 fill-current" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                                    <svg class="w-3 h-3 text-slate-300 fill-current" viewBox="0 0 24 24">
+                                        <path d="M8 5v14l11-7z"/>
+                                    </svg>
                                     <span>Play</span>
                                 </button>
                             </td>
@@ -1263,9 +1029,7 @@ async def serve_dashboard():
     </html>
     """
 
-# ============================================================================
-# 8. SERVICE ENTRYPOINT
-# ============================================================================
+
 def find_available_port(start_port: int = 8000, host: str = "127.0.0.1") -> int:
     port = start_port
     while port < start_port + 100:
